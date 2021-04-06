@@ -1,0 +1,371 @@
+/* This Google Earth Engine java script generates annual summer NDVI composites (85th percentile) using Landsat 5 and 7 data for study regions with field biomass harvests and then 
+/* extracts data for these sample sites.
+
+var ls4 = ee.ImageCollection("LANDSAT/LT4_SR"),
+    ls5 = ee.ImageCollection("LANDSAT/LT5_SR"),
+    ls7 = ee.ImageCollection("LANDSAT/LE7_SR"),
+    water = ee.Image("JRC/GSW1_0/GlobalSurfaceWater"),
+    aoi_ak = /* color: #0b4a8b */ee.Geometry.Polygon(
+        [[[-146.6015625, 68.45133096320211],
+          [-143.5484342292824, 69.56765655774973],
+          [-145.72265625, 70.81909418548398],
+          [-148.271484375, 71.30399497877515],
+          [-155.56640625, 71.74956010203987],
+          [-159.78515625, 71.3321475906429],
+          [-162.24609375, 69.47647073182779],
+          [-166.201171875, 66.96838452243209],
+          [-166.9921875, 64.43920212615465],
+          [-162.24609375, 63.277674044808414],
+          [-156.70898169279099, 67.1738302049392],
+          [-152.66601294279099, 67.66318282925475],
+          [-150.95214575529099, 67.87930292680603]]]),
+    aoi_can = /* color: #ff0000 */ee.Geometry.Polygon(
+        [[[-118.4326171875, 72.81585183645385],
+          [-118.564453125, 73.45325887646389],
+          [-118.564453125, 74.0072333735706],
+          [-118.8720703125, 74.8217375708559],
+          [-116.7626953125, 76.13224963134903],
+          [-117.6416015625, 76.4755969084041],
+          [-119.5751953125, 76.60855265290978],
+          [-120.6298828125, 76.16381301358739],
+          [-121.11328125, 73.5779549418551],
+          [-120.673828125, 72.67245781945552]]]),
+    aoi_ak_2015 = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[-165.9814453125, 64.320546138513],
+          [-148.6669921875, 63.391185367304],
+          [-147.4365234375, 70.46595630808551],
+          [-150.2490234375, 70.583167857457],
+          [-165.4423052330817, 65.52794540705332]]]),
+    aoi_nwt = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[-111.55886650085449, 64.86523804495853],
+          [-111.53693675994873, 64.86480056365382],
+          [-111.53809547424316, 64.87484261084504],
+          [-111.55968189239502, 64.87467861480746]]]),
+    sites = ee.FeatureCollection("users/loganberner/tundra_biomass_sites");
+
+
+Map.addLayer(sites, {color:'red'});
+//throw('stop');
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// DEFINE FUNCTIONS
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// function to select clear pixels from Landsat Fmask 
+function clearskyFmask(img) {return img.updateMask(img.select('cfmask').eq(0))}
+
+// function to further screen potential clouds and cloud shadows after running Fmask, following Ju and Masek (2016)
+function cloudShadowMask(img){
+  var resid_cloud_mask = img.select('B1').lt(0.07);
+  var resid_shadow_mask = img.select('B3').gt(0.01);
+  var combo_mask = resid_cloud_mask.eq(1).or(resid_shadow_mask.eq(1));
+  return img.updateMask(combo_mask.eq(1));
+}
+
+// function to mask out water
+function waterMask(img){
+  var water_occur = water.select('max_extent').unmask();
+  var water_mask = water_occur.eq(0);
+  return img.updateMask(water_mask);
+}
+
+// function to compute NDVI that is scaled by 1000 and rounded
+function ndviBand(img){return img.addBands(img.normalizedDifference(['B4', 'B3']).multiply(1000).round().select([0],['NDVI']));}
+
+// function to compute NDWI that is scaled by 1000 and rounded
+//function ndwiBand(img){return img.addBands(img.normalizedDifference(['B5', 'B2']).multiply(1000).round().select([0],['NDWI']));}
+
+
+// function to collect images, filter by date range, DOY, AOI, and georeference quality, then apply fmask and add ndvi band
+function collectionFilterMask(collection, startDate,endDate,startJulian,endJulian, aoi){  
+  return ee.ImageCollection(collection).filterDate(startDate,endDate)
+  .filter(ee.Filter.calendarRange(startJulian,endJulian)).filterBounds(aoi)
+  .map(clearskyFmask)
+  .map(cloudShadowMask)
+  .map(waterMask)
+  .map(ndviBand);
+  //.map(ndwiBand);
+}
+
+// function to make annual NDVI percentile composites
+var annualComposite = function(collection, startYear, endYear, percentile){
+  var datelist = ee.List.sequence(startYear, endYear, 1);
+  var annualComp = function(d) {
+    var begin = ee.Date.fromYMD(d, 1, 1);
+    var end = begin.advance(1, 'year');
+    var imgCol = collection.filterDate(begin, end);
+    var imgReduced = imgCol.reduce(ee.Reducer.percentile([percentile]));
+    return imgReduced.int16();
+  };
+  return ee.ImageCollection(datelist.map(annualComp));
+};
+
+// function for adjusting LS5 NDVI to match LS7 NDVI 
+var adjTMtoETMndvi = function(img){
+  return img.addBands(img.multiply(1.033846).add(36)).select([1], ['NDVI']); // based on camparison between L5 and L7 on NSlope w/ NDVI scaled by 1000  
+};
+
+// function for adjusting LS5 NDVI to match LS7 NDVI 
+//var adjTMtoETMndvi = function(img){
+//  return img.addBands(img.multiply(0.855070).add(98)).select([1], ['NDWI']); // based on camparison between L5 and L7 on NSlope w/ NDVI scaled by 1000  
+// };
+
+// function for adding the year and DOY to images
+function addYearDOY(img){
+  var img2 = img.set('year', img.date().get('year'));
+  return img2.set('doy', ee.Date(img2.get('system:time_start')).getRelative('day','year').add(1));
+}
+
+// function for attributing an image collection using values stored in a list 
+var attributeCollection = function(imgCol, varList, varName){
+    var pairs = imgCol.toList(imgCol.size()).zip(varList);
+    var paired = ee.ImageCollection(pairs.map(function(pair){
+      pair = ee.List(pair);
+      return ee.Image(pair.get(0)).set(varName, pair.get(1));
+    }));
+    return paired;
+};
+
+
+// function for extracting mean/SD pixel values from image collection using points  
+var extractPts = function(imgCol, pts, dateVar, folder, file){
+  var extract = function(img, ini) {
+    var inifc = ee.FeatureCollection(ini); // type cast
+    var date = img.get(dateVar);
+    var fc2 = img.reduceRegions({
+      collection: pts, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}).combine({reducer3: ee.Reducer.count(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'}); // gets the values for the points in the current img, working in NAD 83 Alaska Albers
+    var fc3 = fc2.map(function(f){return f.set(dateVar, date)}); // writes the date in each feature
+    //var fc4 = fc3.filter(ee.Filter.inList(neq([0], null));//filter first to remove null values
+    //var fc4 = fc3.filter(ee.Filter.neq([0], null));//filter first to remove null values
+    return inifc.merge(fc3); // merges the FeatureCollections
+  };
+  var fc = ee.FeatureCollection(ee.List([])); // Empty Collection to fill
+  var vals = ee.FeatureCollection(imgCol.iterate(extract, fc));
+  Export.table.toDrive(vals, "extract_pxl_vals", folder, file, "CSV");
+};
+
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// DEFINE VARIABLES AND LOAD IMAGE COLLECTION
+// ----------------------------------------------------------------------------------------------------------------------------------------
+var startJulian = 170; // late June 
+var endJulian = 240; // end of Aug
+var ndvi_pcnt = 80;
+
+var sites_buf50 = sites.map(function(x){return x.buffer(50)});
+var sites_buf100 = sites.map(function(x){return x.buffer(100)});
+var sites_buf200 = sites.map(function(x){return x.buffer(200)});
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// CANADA - HIGH ARCTIC
+// ----------------------------------------------------------------------------------------------------------------------------------------
+var startYear_can = 2003;
+var endYear_can = 2006;
+var startDate_can = ee.Date.fromYMD(startYear_can, 1, 1);
+var endDate_can = ee.Date.fromYMD(endYear_can+1, 1, 1); // remember: end date is not inclusive (e.g., '2010' will take data thought 2009)
+
+// compute NDVI
+var ls5_ndvi_can = collectionFilterMask(ls5, startDate_can,endDate_can,startJulian,endJulian,aoi_can).select('NDVI').map(adjTMtoETMndvi);
+var ls7_ndvi_can = collectionFilterMask(ls7, startDate_can,endDate_can,startJulian,endJulian,aoi_can).select('NDVI');
+var lsat_ndvi_can = ee.ImageCollection(ls5_ndvi_can.merge(ls7_ndvi_can));
+var lsat_ndvi_can_80pcnt = lsat_ndvi_can.reduce(ee.Reducer.percentile([80]));
+
+// extract NDVI for each site and export
+var site_ndvi_can_buf50m = lsat_ndvi_can_80pcnt.reduceRegions({
+      collection: sites_buf50, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_can_buf100m = lsat_ndvi_can_80pcnt.reduceRegions({
+      collection: sites_buf100, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_can_buf200m = lsat_ndvi_can_80pcnt.reduceRegions({
+      collection: sites_buf200, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_can_buf50m_count = lsat_ndvi_can_80pcnt.reduceRegions({
+      collection: sites_buf50, 
+      reducer: ee.Reducer.count(),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_can_buf100m_count = lsat_ndvi_can_80pcnt.reduceRegions({
+      collection: sites_buf100, 
+      reducer: ee.Reducer.count(),
+      scale: 30, crs:  'EPSG:3338'});
+
+
+Export.table.toDrive(site_ndvi_can_buf50m, "can_pxl_vals_buf50", "GEE", "atlas_can_site_landsat_ndvi_1997_2000_buf50m", "CSV");
+Export.table.toDrive(site_ndvi_can_buf100m, "can_pxl_vals_buf100", "GEE", "atlas_can_site_landsat_ndvi_1997_2000_buf100m", "CSV");
+//Export.table.toDrive(site_ndvi_can_buf200m, "can_pxl_vals_buf200", "GEE", "atlas_can_site_landsat_ndvi_1997_2000_buf200m", "CSV");
+Export.table.toDrive(site_ndvi_can_buf50m_count, "can_pxl_vals_buf50_count", "GEE", "atlas_can_site_landsat_ndvi_1997_2000_buf50m_count", "CSV");
+Export.table.toDrive(site_ndvi_can_buf100m_count, "can_pxl_vals_buf100_count", "GEE", "atlas_can_site_landsat_ndvi_1997_2000_buf100m_count", "CSV");
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// CANADA - NWT
+// ----------------------------------------------------------------------------------------------------------------------------------------
+var startYear_nwt = 2007;
+var endYear_nwt = 2010;
+var startDate_nwt = ee.Date.fromYMD(startYear_nwt, 1, 1);
+var endDate_nwt = ee.Date.fromYMD(endYear_nwt+1, 1, 1); // remember: end date is not inclusive (e.g., '2010' will take data thought 2009)
+
+// compute NDVI
+var ls5_ndvi_nwt = collectionFilterMask(ls5, startDate_nwt,endDate_nwt,startJulian,endJulian,aoi_nwt).select('NDVI').map(adjTMtoETMndvi);
+var ls7_ndvi_nwt = collectionFilterMask(ls7, startDate_nwt,endDate_nwt,startJulian,endJulian,aoi_nwt).select('NDVI');
+var lsat_ndvi_nwt = ee.ImageCollection(ls5_ndvi_nwt.merge(ls7_ndvi_nwt));
+var lsat_ndvi_nwt_80pcnt = lsat_ndvi_nwt.reduce(ee.Reducer.percentile([80]));
+
+// extract NDVI for each site and export
+var site_ndvi_nwt_buf50m = lsat_ndvi_nwt_80pcnt.reduceRegions({
+      collection: sites_buf50, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_nwt_buf100m = lsat_ndvi_nwt_80pcnt.reduceRegions({
+      collection: sites_buf100, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_nwt_buf200m = lsat_ndvi_nwt_80pcnt.reduceRegions({
+      collection: sites_buf200, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_nwt_buf50m_count = lsat_ndvi_nwt_80pcnt.reduceRegions({
+      collection: sites_buf50, 
+      reducer: ee.Reducer.count(),
+      scale: 30, crs:  'EPSG:3338'});
+
+
+var site_ndvi_nwt_buf100m_count = lsat_ndvi_nwt_80pcnt.reduceRegions({
+      collection: sites_buf100, 
+      reducer: ee.Reducer.count(),
+      scale: 30, crs:  'EPSG:3338'});
+
+
+Export.table.toDrive(site_ndvi_nwt_buf50m, "nwt_pxl_vals_buf50", "GEE", "atlas_nwt_site_landsat_ndvi_1997_2000_buf50m", "CSV");
+Export.table.toDrive(site_ndvi_nwt_buf100m, "nwt_pxl_vals_buf100", "GEE", "atlas_nwt_site_landsat_ndvi_1997_2000_buf100m", "CSV");
+//Export.table.toDrive(site_ndvi_nwt_buf200m, "nwt_pxl_vals_buf200", "GEE", "atlas_nwt_site_landsat_ndvi_1997_2000_buf200m", "CSV");
+Export.table.toDrive(site_ndvi_nwt_buf50m_count, "nwt_pxl_vals_buf50_count", "GEE", "atlas_nwt_site_landsat_ndvi_1997_2000_buf50m_count", "CSV");
+Export.table.toDrive(site_ndvi_nwt_buf100m_count, "nwt_pxl_vals_buf100_count", "GEE", "atlas_nwt_site_landsat_ndvi_1997_2000_buf100m_count", "CSV");
+
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// ALASKA 
+// ----------------------------------------------------------------------------------------------------------------------------------------
+var startYear_ak = 1997;
+var endYear_ak = 2000;
+var startDate_ak = ee.Date.fromYMD(startYear_ak, 1, 1);
+var endDate_ak = ee.Date.fromYMD(endYear_ak+1, 1, 1); // remember: end date is not inclusive (e.g., '2010' will take data thought 2009)
+
+// compute NDVI
+var ls5_ndvi_ak = collectionFilterMask(ls5, startDate_ak,endDate_ak,startJulian,endJulian,aoi_ak).select('NDVI').map(adjTMtoETMndvi);
+var ls7_ndvi_ak = collectionFilterMask(ls7, startDate_ak,endDate_ak,startJulian,endJulian,aoi_ak).select('NDVI');
+var lsat_ndvi_ak = ee.ImageCollection(ls5_ndvi_ak.merge(ls7_ndvi_ak));
+var lsat_ndvi_ak_80pcnt = lsat_ndvi_ak.reduce(ee.Reducer.percentile([80]));
+
+// extract NDVI for each site and export
+var site_ndvi_ak_buf50m = lsat_ndvi_ak_80pcnt.reduceRegions({
+      collection: sites_buf50, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_ak_buf100m = lsat_ndvi_ak_80pcnt.reduceRegions({
+      collection: sites_buf100, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_ak_buf200m = lsat_ndvi_ak_80pcnt.reduceRegions({
+      collection: sites_buf200, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_ak_buf50m_count = lsat_ndvi_ak_80pcnt.reduceRegions({
+      collection: sites_buf50, 
+      reducer: ee.Reducer.count(),
+      scale: 30, crs:  'EPSG:3338'});
+
+
+var site_ndvi_ak_buf100m_count = lsat_ndvi_ak_80pcnt.reduceRegions({
+      collection: sites_buf100, 
+      reducer: ee.Reducer.count(),
+      scale: 30, crs:  'EPSG:3338'});
+
+
+
+Export.table.toDrive(site_ndvi_ak_buf50m, "ak_pxl_vals_buf50", "GEE", "atlas_ak_site_landsat_ndvi_1997_2000_buf50m", "CSV");
+Export.table.toDrive(site_ndvi_ak_buf100m, "ak_pxl_vals_buf100", "GEE", "atlas_ak_site_landsat_ndvi_1997_2000_buf100m", "CSV");
+//Export.table.toDrive(site_ndvi_ak_buf200m, "ak_pxl_vals_buf200", "GEE", "atlas_ak_site_landsat_ndvi_1997_2000_buf200m", "CSV");
+Export.table.toDrive(site_ndvi_ak_buf50m_count, "ak_pxl_vals_buf50_cnt", "GEE", "atlas_ak_site_landsat_ndvi_1997_2000_buf50m_count", "CSV");
+Export.table.toDrive(site_ndvi_ak_buf100m_count, "ak_pxl_vals_buf100_cnt", "GEE", "atlas_ak_site_landsat_ndvi_1997_2000_buf100m_count", "CSV");
+
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// ALASKA- 2015
+// ----------------------------------------------------------------------------------------------------------------------------------------
+var startYear_ak_2015 = 2012;
+var endYear_ak_2015 = 2015;
+var startDate_ak_2015 = ee.Date.fromYMD(startYear_ak_2015, 1, 1);
+var endDate_ak_2015 = ee.Date.fromYMD(endYear_ak_2015+1, 1, 1); // remember: end date is not inclusive (e.g., '2010' will take data thought 2009)
+
+// compute NDVI
+var ls5_ndvi_ak_2015 = collectionFilterMask(ls5, startDate_ak_2015,endDate_ak_2015,startJulian,endJulian,aoi_ak_2015).select('NDVI').map(adjTMtoETMndvi);
+var ls7_ndvi_ak_2015 = collectionFilterMask(ls7, startDate_ak_2015,endDate_ak_2015,startJulian,endJulian,aoi_ak_2015).select('NDVI');
+var lsat_ndvi_ak_2015 = ee.ImageCollection(ls5_ndvi_ak_2015.merge(ls7_ndvi_ak_2015));
+var lsat_ndvi_ak_2015_80pcnt = lsat_ndvi_ak_2015.reduce(ee.Reducer.percentile([80]));
+
+// extract NDVI for each site and export
+var site_ndvi_ak_2015_buf50m = lsat_ndvi_ak_2015_80pcnt.reduceRegions({
+      collection: sites_buf50, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_ak_2015_buf100m = lsat_ndvi_ak_2015_80pcnt.reduceRegions({
+      collection: sites_buf100, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_ak_2015_buf200m = lsat_ndvi_ak_2015_80pcnt.reduceRegions({
+      collection: sites_buf200, 
+      reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_ak_2015_buf50m_count = lsat_ndvi_ak_2015_80pcnt.reduceRegions({
+      collection: sites_buf50, 
+      reducer: ee.Reducer.count(),
+      scale: 30, crs:  'EPSG:3338'});
+
+var site_ndvi_ak_2015_buf100m_count = lsat_ndvi_ak_2015_80pcnt.reduceRegions({
+      collection: sites_buf100, 
+      reducer: ee.Reducer.count(),
+      scale: 30, crs:  'EPSG:3338'});
+
+/*
+Export.table.toDrive(site_ndvi_ak_2015_buf50m, "ak_2015_pxl_vals_buf50", "GEE", "atlas_ak_2015_site_landsat_ndvi_1997_2000_buf50m", "CSV");
+Export.table.toDrive(site_ndvi_ak_2015_buf100m, "ak_2015_pxl_vals_buf100", "GEE", "atlas_ak_2015_site_landsat_ndvi_1997_2000_buf100m", "CSV");
+Export.table.toDrive(site_ndvi_ak_2015_buf200m, "ak_2015_pxl_vals_buf200", "GEE", "atlas_ak_2015_site_landsat_ndvi_1997_2000_buf200m", "CSV");
+Export.table.toDrive(site_ndvi_ak_2015_buf100m_count, "ak_2015_pxl_vals_buf100_cnt", "GEE", "atlas_ak_2015_site_landsat_ndvi_1997_2000_buf100m_count", "CSV");
+*/
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// VISUALIZE MEDIAN OF NDVI MOSAICS AND SITE LOCATIONS
+// ----------------------------------------------------------------------------------------------------------------------------------------
+
+var ndviVisParams = {min: 0, max: 900, palette: ['FFFFFF', 'CE7E45', 'FCD163', '66A000', '207401','056201', '004C00', '023B01', '012E01', '011301']};
+
+Map.centerObject(aoi_can,6);
+Map.addLayer(lsat_ndvi_ak_80pcnt, ndviVisParams, 'NDVI', 0.5);
+Map.addLayer(lsat_ndvi_can_80pcnt, ndviVisParams, 'NDVI', 0.5);
+Map.addLayer(lsat_ndvi_nwt_80pcnt, ndviVisParams, 'NDVI', 0.5);
+Map.addLayer(lsat_ndvi_ak_2015_80pcnt, ndviVisParams, 'NDVI-2015', 0.5);
+Map.addLayer(sites, {color: 'blue'}, 'sites', true, 1);
+
+
+throw('stop');

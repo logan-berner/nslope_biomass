@@ -1,0 +1,195 @@
+/* This Google Earth Engine java script generates an annual summer NDVI composite mosaic using Landsat 5 and 7 data from the Alaskan North Slope.
+
+var ls5 = ee.ImageCollection("LANDSAT/LT5_SR"),
+    ls7 = ee.ImageCollection("LANDSAT/LE7_SR"),
+    water = ee.Image("JRC/GSW1_0/GlobalSurfaceWater"),
+    aoi = ee.FeatureCollection("users/loganberner/nslope");
+
+//throw('stop');
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// DEFINE FUNCTIONS
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// function to select clear pixels from Landsat Fmask 
+function clearSkyFmask(img) {return img.updateMask(img.select('cfmask').eq(0))}
+
+// function to further screen potential clouds and cloud shadows after running Fmask, following Ju and Masek (2016)
+function cloudShadowMask(img){
+  var resid_cloud_mask = img.select('B1').lt(0.07);
+  var resid_shadow_mask = img.select('B3').gt(0.01);
+  var combo_mask = resid_cloud_mask.eq(1).or(resid_shadow_mask.eq(1));
+  return img.updateMask(combo_mask.eq(1));
+}
+
+// function to mask out water
+function waterMask(img){
+  //var water_occur = water.select('max_extent').unmask();
+  //var water_mask = water_occur.eq(0);
+  var water_occur = water.select('occurrence').unmask();
+  var water_mask = water_occur.lte(50);
+  return img.updateMask(water_mask);
+}
+
+// function to compute NDVI that is scaled by 1000 and rounded, whith values < 0 set to 0
+function ndviBand(img){
+  var ndvi = img.normalizedDifference(['B4', 'B3']).multiply(1000).round().select([0],['NDVI']);
+  var ndvi2 = ndvi.where(ndvi.lte(0),0); 
+  return img.addBands(ndvi2);}
+
+// function for adjusting LS5 NDVI to match LS7 NDVI 
+var ndviAdjTMtoETM = function(img){
+  var ndvi = img.select('NDVI');
+  var ndviAdj = ndvi.multiply(1.033846).add(36);
+  return img.addBands(ndviAdj, ee.List(['NDVI']), true);
+};
+
+// function for adding a band containing image date as year
+function yearBand(img) {
+  var year = img.date().get('year');
+  var year2 = ee.Image(year).float().rename('year');
+  return img.addBands(year2);
+}
+
+// function to collect images, filter by date range, DOY, AOI, and georeference quality, then apply fmask and add ndvi band
+function collectionFilterMask(collection, startDate,endDate,startJulian,endJulian, aoi){  
+  return ee.ImageCollection(collection).filterDate(startDate,endDate)
+  .filter(ee.Filter.calendarRange(startJulian,endJulian)).filterBounds(aoi)
+  .map(clearSkyFmask)
+  .map(cloudShadowMask)
+  .map(waterMask)
+  .map(ndviBand)
+  .map(yearBand);
+}
+
+// function for adding the year and DOY to images
+function addYearDOY(img){
+  var img2 = img.set('year', img.date().get('year'));
+  return img2.set('doy', ee.Date(img2.get('system:time_start')).getRelative('day','year'));
+}
+
+//function to make pctl th value composite; code from Richard
+function makeComposite(collection,percentile,VI) {
+  var ndvi = collection.select(VI).reduce(ee.Reducer.percentile([percentile])); 
+  var withDist = collection.map(function(image) {
+    return image.addBands(image.select(VI).subtract(ndvi).abs().multiply(-1).rename('quality'));
+  });
+  return withDist.qualityMosaic('quality');
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// DEFINE VARIABLES AND LOAD IMAGE COLLECTION
+// ----------------------------------------------------------------------------------------------------------------------------------------
+var startYear = 2007;
+var endYear = 2016;
+var startDate = ee.Date.fromYMD(startYear, 1, 1);
+var endDate = ee.Date.fromYMD(endYear+1, 1, 1); // remember: end date is not inclusive (e.g., '2010' will take data thought 2009)
+var startJulian = 170; // late June 
+var endJulian = 240; // end of Aug
+var ndvi_pcnt = 80;
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// FILTER SPATIALLY AND TEMPORALLY, QA SCREEN, COMPUTE NDVI, MERGE LANDSAT 4, 5 AND 7 COLLECTIONS
+// ----------------------------------------------------------------------------------------------------------------------------------------
+var ls5_imgCol = collectionFilterMask(ls5, startDate,endDate,startJulian,endJulian,aoi).map(ndviAdjTMtoETM).map(addYearDOY);
+var ls7_imgCol = collectionFilterMask(ls7, startDate,endDate,startJulian,endJulian,aoi).map(addYearDOY);
+var lsat_imgCol = ee.ImageCollection(ls5_imgCol.merge(ls7_imgCol)).sort('year');
+var lsat_mosaic = makeComposite(lsat_imgCol, ndvi_pcnt, 'NDVI').clip(aoi);
+var lsat_ndviPeak = lsat_mosaic.select('NDVI');
+var lsat_ndviPeak_year = lsat_mosaic.select('year');
+var lsat_nScenes = lsat_imgCol.select('NDVI').reduce(ee.Reducer.count()).clip(aoi);
+
+print(lsat_imgCol, 'lsat imgCol');
+
+//throw('stop');
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// DETERMINE (1) NUMBER OF SCENES PER COLLECTION; (2) YEAR OF EACH SCENE; (3) UNIQUE YEARS
+// ----------------------------------------------------------------------------------------------------------------------------------------
+var lsat_sceneDOY = lsat_imgCol.aggregate_array('doy');
+var lsat_sceneYears = lsat_imgCol.aggregate_array('year');
+var lsat_uniqYears = lsat_imgCol.distinct(['year']).aggregate_array('year');
+
+print(lsat_sceneDOY, 'lsat-scene-doy');
+print(lsat_sceneYears, 'lsat-scene-years');
+print(lsat_uniqYears, 'lsat-unique-years');
+
+print(ls5_imgCol.size(), 'ls5-nscenes');
+print(ls7_imgCol.size(), 'ls7-nscenes');
+print(lsat_imgCol.size(), 'lsat-nscenes');
+
+//throw('stop');
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// VISUALIZE NDVI composite mosaic for N. Slope
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// Define the visualization parameters.
+var vizParams = {
+  bands: ['B3', 'B2', 'B1'],
+  min: 0,
+  max: 1000,
+  gamma: [1, 1, 1]
+};
+
+//Map.centerObject(aoi,7);
+Map.addLayer(lsat_mosaic, vizParams, 'Landsat', 0.5);
+//Map.addLayer(lsat_nScenes, {min:0, max:50}, 'N scenes', 0.5);
+
+throw('stop');
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// EXPORT MOSAICS
+// ----------------------------------------------------------------------------------------------------------------------------------------
+// Number of scenes per pixel going into developing quality mosaic
+Export.image.toDrive({
+  image: lsat_nScenes, 
+  description: 'Lsat57_nslope_nscenes_p'+ndvi_pcnt+'_doy'+startJulian+"to"+endJulian+"_"+startYear+"to"+endYear,
+  folder: 'GEE', 
+  scale: 30,
+  region: aoi.geometry().bounds(),
+  crs: 'EPSG:3338', // NAD 83 Alaska Albers
+  maxPixels: 5e10 
+  });
+
+// Year of 'peak summer' NDVI
+Export.image.toDrive({
+  image: lsat_ndviPeak_year, 
+  description: 'Lsat57_nslope_year_of_peakNDVI_p'+ndvi_pcnt+'_doy'+startJulian+"to"+endJulian+"_"+startYear+"to"+endYear,
+  folder: 'GEE', 
+  scale: 30,
+  region: aoi.geometry().bounds(),
+  crs: 'EPSG:3338', // NAD 83 Alaska Albers
+  maxPixels: 5e10 
+  });
+
+// Red surface reflectance from quality mosaic
+Export.image.toDrive({
+  image: lsat_mosaic.select('B3'), 
+  description: 'Lsat57_nslope_B3_surfRef_ndviP'+ndvi_pcnt+'_doy'+startJulian+"to"+endJulian+"_"+startYear+"to"+endYear+"_qualMos",
+  folder: 'GEE', 
+  scale: 30,
+  region: aoi.geometry().bounds(),
+  crs: 'EPSG:3338', // NAD 83 Alaska Albers
+  maxPixels: 5e10 
+  });
+
+// Near IR surface reflectance from quality mosaic
+Export.image.toDrive({
+  image: lsat_mosaic.select('B4'), 
+  description: 'Lsat57_nslope_B4_surfRef_ndviP'+ndvi_pcnt+'_doy'+startJulian+"to"+endJulian+"_"+startYear+"to"+endYear+"_qualMos",
+  folder: 'GEE', 
+  scale: 30,
+  region: aoi.geometry().bounds(),
+  crs: 'EPSG:3338', // NAD 83 Alaska Albers
+  maxPixels: 5e10 
+  });
+
+throw('stop');
+Export.image.toAsset({
+  image: lsat_ndviPeak,
+  description: 'Export_lsat_ndvi_nslope',
+  assetId: 'Lsat57_nslope_ndvi_p'+ndvi_pcnt+'_doy'+startJulian+"to"+endJulian+"_"+startYear+"to"+endYear,
+  scale: 30,
+  region: aoi.geometry().bounds(),
+  crs: 'EPSG:3338', // NAD 83 Alaska Albers
+  maxPixels: 5e9 
+});
+
